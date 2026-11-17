@@ -10,3 +10,4 @@ scikit-image
 dlib-bin
 matplotlib
 tqdm
+opencv
