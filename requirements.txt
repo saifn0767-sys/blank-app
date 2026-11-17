@@ -1,0 +1,12 @@
+streamlit
+streamlit-webrtc
+av
+opencv-python-headless
+numpy
+pandas
+joblib
+scikit-learn
+scikit-image
+dlib-bin
+matplotlib
+tqdm
