@@ -1,249 +1,158 @@
-import csv
-import sys
-import tempfile
-import threading
-import time
-from datetime import datetime
 from pathlib import Path
+import time
+import uuid
+import threading
 
 import cv2
 import joblib
 import numpy as np
-import pandas as pd
 import streamlit as st
-import streamlit.components.v1 as components
-from streamlit_webrtc import VideoProcessorBase, webrtc_streamer
+from streamlit_autorefresh import st_autorefresh
+from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, WebRtcMode
 
-HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE))
-sys.path.insert(0, str(HERE.parent))
-LOG_PATH = HERE / "predictions_log.csv"
-LOCK = threading.Lock()
+from vision.feature_extraction import extract_all_features, load_predictor
+from database.db import initialize_db, log_prediction, read_logs, export_csv, EMOTIONS
+from dashboard.visualizations import show_dashboard
 
-st.set_page_config(page_title="Emotion Dashboard", layout="wide")
+ROOT = Path(__file__).resolve().parent
+MODEL_FILE = ROOT / 'models' / 'ck48_final_model.joblib'
+PREDICTOR_FILE = ROOT / 'shape_predictor_68_face_landmarks.dat'
+
+
+
+st.set_page_config(page_title='Facial Emotion System', page_icon='🙂', layout='wide')
 
 
 @st.cache_resource
-def load_everything():
-  try:
-    import ck48_features as ck
-  except ImportError:
-    st.error(
-        "❌ لم يتم العثور على ملف `ck48_features.py`. تأكد من وجوده في نفس المجلد."
-    )
+def load_assets():
+    if not MODEL_FILE.exists():
+        raise FileNotFoundError(f'Model missing: {MODEL_FILE}')
+    if not PREDICTOR_FILE.exists():
+        raise FileNotFoundError(f'Dlib predictor missing: {PREDICTOR_FILE}')
+    return joblib.load(MODEL_FILE), load_predictor(PREDICTOR_FILE)
+
+
+initialize_db()
+
+
+# Shared, thread-safe data exchanged between WebRTC frame callback and Streamlit UI.
+class SharedState:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.latest = {'label': None, 'probabilities': {}, 'confidence': None, 'error': None, 'face_found': False}
+        self.session_id = uuid.uuid4().hex[:10]
+        self.last_logged = 0.0
+        self.prediction_count = 0
+
+
+if 'shared_state' not in st.session_state:
+    st.session_state.shared_state = SharedState()
+state = st.session_state.shared_state
+
+
+try:
+    model, predictor = load_assets()
+except Exception as exc:
+    st.error(f'Cannot load model assets: {exc}')
+    st.info('Place models/ck48_final_model.joblib and shape_predictor_68_face_landmarks.dat in the project root as described in README.')
     st.stop()
 
-  name = "ck48_landmarks_hog_lbp_pca_logreg.joblib"
-  local = HERE / name
-  model_path = local if local.exists() else ck.OUTPUT_DIR / name
 
-  if not model_path.exists():
-    st.error(
-        f"❌ ملف النموذج `{name}` غير موجود في المسار: `{model_path}`.\n\nيرجى"
-        " تشغيل سكربت التدريب أولاً لإنشاء الملف."
-    )
-    st.stop()
+class EmotionVideoProcessor(VideoProcessorBase):
+    def __init__(self):
+        self.last_log_time = 0.0
 
-  try:
-    model = joblib.load(model_path)
-    return ck, model
-  except Exception as e:
-    st.error(f"❌ حدث خطأ أثناء تحميل النموذج: {e}")
-    st.stop()
+        # Assets are loaded from Streamlit cached resource in the main thread.
+        self.model = model
+        self.predictor = predictor
+        self.shared = state
 
 
-ck, model = load_everything()
-CLASSES = list(model.named_steps["classifier"].classes_)
-HEADER = ["timestamp", "date", "hour", "emotion", "confidence"] + [
-    f"p_{c}" for c in CLASSES
-]
-if not LOG_PATH.exists():
-  with open(LOG_PATH, "w", newline="", encoding="utf-8") as f:
-    csv.writer(f).writerow(HEADER)
+    def recv(self, frame):
+        image = frame.to_ndarray(format='bgr24')
+        display = image.copy()
+        try:
+            features, face, points = extract_all_features(image, self.predictor)
+            if features is None:
+                with self.shared.lock:
+                    self.shared.latest = {'label': None, 'probabilities': {}, 'confidence': None, 'error': None, 'face_found': False}
+                cv2.putText(display, 'No face detected', (18, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 165, 255), 2)
+            else:
+                predicted = self.model.predict(features)[0]
+                raw_prob = self.model.predict_proba(features)[0]
+                classes = [str(x) for x in self.model.classes_]
+                probs = {c: float(p) for c, p in zip(classes, raw_prob)}
+                label = str(predicted)
+                confidence = float(probs.get(label, np.max(raw_prob)))
+                # Draw landmarks and label on video frame.
+                for x, y in points.astype(int):
+                    if 0 <= x < display.shape[1] and 0 <= y < display.shape[0]:
+                        cv2.circle(display, (x, y), 1, (50, 220, 80), -1)
+                cv2.putText(display, f'{label.upper()}  {confidence:.1%}', (18, 35),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.85, (30, 220, 90), 2, cv2.LINE_AA)
+                with self.shared.lock:
+                    self.shared.latest = {'label': label, 'probabilities': probs, 'confidence': confidence, 'error': None, 'face_found': True}
+                    self.shared.prediction_count += 1
+                now = time.time()
+                # Limit database writes to once every 2 seconds per stream.
+                if now - self.last_log_time >= 2.0:
+                    log_prediction(self.shared.session_id, label, probs)
+                    self.last_log_time = now
+        except Exception as exc:
+            with self.shared.lock:
+                self.shared.latest = {'label': None, 'probabilities': {}, 'confidence': None, 'error': str(exc), 'face_found': False}
+            cv2.putText(display, 'Processing error - check model feature dimensions', (18, 35),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
+        return frame.from_ndarray(display, format='bgr24')
 
 
-def predict_frame(frame_bgr):
-  """Returns (emotion, confidence, probs, (x, y, w, h) in pixels) or None if no face."""
-  gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+st.title('Facial Emotion Recognition System')
+st.caption('CK+ facial-expression classifier • Handcrafted features • Multinomial Logistic Regression • No deep learning')
+page = st.sidebar.radio('Navigation', ['Live Recognition', 'Analytics Dashboard', 'Export Data'])
 
-  # تسريع الكشف عن طريق تصغير الإطار إلى النصف
-  scale = 0.5
-  gray_small = cv2.resize(gray, (0, 0), fx=scale, fy=scale)
+if page == 'Live Recognition':
+    st.markdown('### Live camera')
+    st.warning('The webcam processor must use the exact same feature extraction as training. This ZIP includes a modular handcrafted extractor template; confirm it matches your CK+ training script before interpreting predictions.')
+    col_video, col_result = st.columns([1.65, 1])
+    with col_video:
+        webrtc_streamer(
+            key='emotion-live-camera',
+            mode=WebRtcMode.SENDRECV,
+            video_processor_factory=EmotionVideoProcessor,
+            media_stream_constraints={'video': True, 'audio': False},
+            async_processing=True,
+        )
+    with col_result:
+        st.markdown('### Current prediction')
+        st_autorefresh(interval=1200, key='live_metrics_refresh')
+        with state.lock:
+            latest = dict(state.latest)
+            probs = dict(latest.get('probabilities') or {})
+            count = state.prediction_count
+        if latest.get('error'):
+            st.error(latest['error'])
+        if latest.get('label'):
+            st.metric('Predicted expression', latest['label'].upper())
+            st.metric('Predicted class probability', f"{latest['confidence']:.1%}")
+            st.metric('Frames processed', count)
+            if probs:
+                st.bar_chart({k: v for k, v in sorted(probs.items(), key=lambda x: x[1], reverse=True)})
+        else:
+            st.info('Start the camera and position your face in view.')
+    st.caption('Predicted facial-expression labels are not direct measurements of a person’s internal emotional state. Images are not saved by this app.')
 
-  # استخدام 0 بدلاً من 1 لتقليل وقت المعالجة بشكل كبير
-  faces = ck.detector(gray_small, 0)
-  if not faces:
-    return None
+elif page == 'Analytics Dashboard':
+    st.header('Analytics Dashboard')
+    st_autorefresh(interval=5000, key='analytics_refresh')
+    show_dashboard(read_logs())
 
-  # اختيار أكبر وجه وإعادة حساب الإحداثيات للحجم الأصلي
-  f = max(faces, key=lambda r: r.width() * r.height())
-  inv_scale = 1.0 / scale
-  x1 = int(f.left() * inv_scale)
-  y1 = int(f.top() * inv_scale)
-  x2 = int(f.right() * inv_scale)
-  y2 = int(f.bottom() * inv_scale)
-
-  m = int(0.1 * (x2 - x1))
-  x1, y1 = max(0, x1 - m), max(0, y1 - m)
-  x2, y2 = min(gray.shape[1], x2 + m), min(gray.shape[0], y2 + m)
-
-  face = gray[y1:y2, x1:x2]
-  if face.size == 0:
-    return None
-
-  face = cv2.resize(face, (48, 48), interpolation=cv2.INTER_AREA)
-  with tempfile.TemporaryDirectory() as tmp:
-    p = Path(tmp) / "face.png"
-    cv2.imwrite(str(p), face)
-    feats = ck.extract_all_features(p)
-
-  if feats is None or not np.isfinite(feats).all():
-    return None
-
-  probs = model.predict_proba(feats.reshape(1, -1))[0]
-  i = int(np.argmax(probs))
-  return (
-      CLASSES[i],
-      float(probs[i]),
-      dict(zip(CLASSES, map(float, probs))),
-      (x1, y1, x2 - x1, y2 - y1),
-  )
-
-
-def log_prediction(emotion, conf, probs):
-  now = datetime.now()
-  row = [
-      now.isoformat(timespec="seconds"),
-      now.date().isoformat(),
-      now.hour,
-      emotion,
-      round(conf, 4),
-  ]
-  row += [round(probs[c], 4) for c in CLASSES]
-  with LOCK, open(LOG_PATH, "a", newline="", encoding="utf-8") as f:
-    csv.writer(f).writerow(row)
-
-
-class LiveProcessor(VideoProcessorBase):
-
-  def __init__(self):
-    self.latest = None
-    self.last_pred = 0.0
-    self.last_log = 0.0
-    self.box = None
-    self.label = ""
-
-  def recv(self, frame):
-    import av
-
-    img = frame.to_ndarray(format="bgr24")
-    now = time.time()
-    if now - self.last_pred > 0.3:  # تقييد التنبؤ إلى ~3 مرات في الثانية
-      self.last_pred = now
-      res = predict_frame(img)
-      if res:
-        emo, conf, probs, self.box = res
-        self.latest = (emo, conf, probs)
-        self.label = f"{emo} {conf:.0%}"
-        if now - self.last_log > 2:
-          self.last_log = now
-          log_prediction(emo, conf, probs)
-      else:
-        self.box, self.label, self.latest = None, "", None
-    if self.box:
-      x, y, w, h = self.box
-      cv2.rectangle(img, (x, y), (x + w, y + h), (180, 212, 45), 2)
-      cv2.putText(
-          img,
-          self.label,
-          (x, max(20, y - 8)),
-          cv2.FONT_HERSHEY_SIMPLEX,
-          0.7,
-          (180, 212, 45),
-          2,
-      )
-    return av.VideoFrame.from_ndarray(img, format="bgr24")
-
-
-def show_probs(container, latest):
-  if latest is None:
-    container.info("⚠️ لم يتم العثور على وجه. يرجى الوقوف أمام الكاميرا بإضاءة جيدة.")
-    return
-  emo, conf, probs = latest
-  with container.container():
-    st.subheader(f"{emo} ({conf:.0%})")
-    for k, v in sorted(probs.items(), key=lambda kv: -kv[1]):
-      st.progress(v, text=f"{k}  {v:.0%}")
-
-
-st.title("Emotion dashboard")
-tab_live, tab_cap, tab_tab = st.tabs(["Real-time", "Capture", "Tableau analysis"])
-
-with tab_live:
-  st.info(
-      "💡 ملاحظة: عند تشغيل الكاميرا لأول مرة، يرجى السماح للمتصفح بالوصول إليها"
-      " عند ظهور النافذة المنبثقة."
-  )
-  left, right = st.columns([3, 2])
-  with left:
-    try:
-      ctx = webrtc_streamer(
-          key="live",
-          video_processor_factory=LiveProcessor,
-          media_stream_constraints={"video": True, "audio": False},
-          rtc_configuration={
-              "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
-          },
-          async_processing=True,
-      )
-    except Exception as e:
-      st.error(
-          "❌ حدث خطأ في تشغيل الكاميرا. تأكد من إعطاء الصلاحيات اللازمة للمتصفح"
-          f" أو عدم استخدامها من تطبيق آخر. التفاصيل: {e}"
-      )
-  holder = right.empty()
-  if ctx.state.playing:
-    while ctx.state.playing:
-      if ctx.video_processor:
-        show_probs(holder, ctx.video_processor.latest)
-      time.sleep(0.4)
-  else:
-    holder.caption(
-        "اضغط على زر Start لتشغيل الكاميرا. يتم حفظ تنبؤ واحد كل ثانيتين في السجل."
-    )
-
-with tab_cap:
-  photo = st.camera_input("Take a photo")
-  if photo is not None:
-    frame = cv2.imdecode(
-        np.frombuffer(photo.getvalue(), np.uint8), cv2.IMREAD_COLOR
-    )
-    res = predict_frame(frame)
-    if res is None:
-      st.error("لم يتم العثور على وجه. يرجى إعادة التقاط الصورة بوضوح.")
-    else:
-      emo, conf, probs, _ = res
-      log_prediction(emo, conf, probs)
-      show_probs(st.container(), (emo, conf, probs))
-      st.success("تم الحفظ في السجل بنجاح.")
-
-with tab_tab:
-  if LOG_PATH.exists():
-    df = pd.read_csv(LOG_PATH)
-    c1, c2 = st.columns([1, 2])
-    with c1:
-      st.metric("Logged predictions", len(df))
-      st.download_button(
-          "Download CSV for Tableau",
-          df.to_csv(index=False),
-          "predictions_log.csv",
-          "text/csv",
-      )
-      st.dataframe(
-          df.tail(10)
-          .iloc[::-1]
-          [["timestamp", "emotion", "confidence"]],
-          hide_index=True,
-      )
-  else:
-    st.info("لا توجد سجلات تنبؤ حتى الآن.")
+else:
+    st.header('Export prediction data')
+    df = read_logs()
+    st.dataframe(df, use_container_width=True)
+    if not df.empty:
+        csv_bytes = df.to_csv(index=False).encode('utf-8')
+        st.download_button('Download CSV for Tableau', csv_bytes, 'emotion_log.csv', 'text/csv')
+        if st.button('Update data/emotion_log.csv'):
+            path = export_csv()
+            st.success(f'Exported: {path}')
