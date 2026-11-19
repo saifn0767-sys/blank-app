@@ -1,4 +1,5 @@
-cmake
 build-essential
+cmake
+libopenblas-dev
+liblapack-dev
 libgl1
-opencv-python
