@@ -37,8 +37,10 @@ def _database_url():
     if not url:
         return f"sqlite:///{DATA_DIR / 'emotion_log.db'}"
     url = str(url).strip().strip('\'"')
-    if url.startswith('postgres://'):
-        url = url.replace('postgres://', 'postgresql://', 1)
+    for prefix in ('postgres://', 'postgresql://', 'postgresql+psycopg2://'):
+        if url.startswith(prefix):
+            url = 'postgresql+psycopg://' + url[len(prefix):]
+            break
     return url
 
 
