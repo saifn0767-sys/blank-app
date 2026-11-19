@@ -26,7 +26,6 @@ emotion_log = Table(
     *[Column(e, Float, default=0.0) for e in EMOTIONS],
 )
 
-
 def _database_url():
     url = os.environ.get('DATABASE_URL')
     if not url:
@@ -37,6 +36,7 @@ def _database_url():
             url = None
     if not url:
         return f"sqlite:///{DATA_DIR / 'emotion_log.db'}"
+    url = str(url).strip().strip('\'"')
     if url.startswith('postgres://'):
         url = url.replace('postgres://', 'postgresql://', 1)
     return url
