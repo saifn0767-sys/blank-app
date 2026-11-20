@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 import time
 import uuid
@@ -21,6 +22,22 @@ PREDICTOR_FILE = ROOT / 'shape_predictor_68_face_landmarks.dat'
 
 
 st.set_page_config(page_title='Facial Emotion System', page_icon='🙂', layout='wide')
+
+
+def get_rtc_configuration():
+    """STUN always; adds a TURN relay when TURN_URL / TURN_USERNAME / TURN_CREDENTIAL
+    are set in Streamlit secrets or environment (needed on mobile data / VPN)."""
+    servers = [{'urls': ['stun:stun.l.google.com:19302']}]
+    def _get(key):
+        try:
+            return st.secrets.get(key) or os.environ.get(key)
+        except Exception:
+            return os.environ.get(key)
+    url, user, cred = _get('TURN_URL'), _get('TURN_USERNAME'), _get('TURN_CREDENTIAL')
+    if url and user and cred:
+        urls = [u.strip() for u in str(url).split(',') if u.strip()]
+        servers.append({'urls': urls, 'username': str(user), 'credential': str(cred)})
+    return {'iceServers': servers}
 
 
 @st.cache_resource
@@ -125,7 +142,7 @@ if page == 'Live Recognition':
             video_processor_factory=EmotionVideoProcessor,
             media_stream_constraints={'video': True, 'audio': False},
             async_processing=True,
-            rtc_configuration={'iceServers': [{'urls': ['stun:stun.l.google.com:19302']}]},
+            rtc_configuration=get_rtc_configuration(),
         )
     with col_result:
         st.markdown('### Current prediction')
