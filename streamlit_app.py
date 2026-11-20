@@ -1,4 +1,5 @@
 import os
+import re
 from pathlib import Path
 import time
 import uuid
@@ -24,20 +25,42 @@ PREDICTOR_FILE = ROOT / 'shape_predictor_68_face_landmarks.dat'
 st.set_page_config(page_title='Facial Emotion System', page_icon='🙂', layout='wide')
 
 
+def _secret(key):
+    try:
+        value = st.secrets.get(key)
+    except Exception:
+        value = None
+    return value or os.environ.get(key)
+
+
+def parse_turn_urls(raw):
+    """Accepts a clean comma list or text pasted from the provider
+    (e.g. 'urls: "turn:host:80", urls: "turns:host:443?transport=tcp"').
+    Keeps only turn:/turns: URLs (STUN is added separately) and removes duplicates."""
+    found = re.findall(r'turns?:[^\s"\',\]\[]+', str(raw or ''))
+    return list(dict.fromkeys(found))
+
+
 def get_rtc_configuration():
-    """STUN always; adds a TURN relay when TURN_URL / TURN_USERNAME / TURN_CREDENTIAL
-    are set in Streamlit secrets or environment (needed on mobile data / VPN)."""
+    """STUN always. Adds a TURN relay when TURN_URL / TURN_USERNAME / TURN_CREDENTIAL
+    are set (Streamlit secrets or env). Set TURN_FORCE_RELAY = true to test that the
+    relay really works (all media is then forced through TURN)."""
     servers = [{'urls': ['stun:stun.l.google.com:19302']}]
-    def _get(key):
-        try:
-            return st.secrets.get(key) or os.environ.get(key)
-        except Exception:
-            return os.environ.get(key)
-    url, user, cred = _get('TURN_URL'), _get('TURN_USERNAME'), _get('TURN_CREDENTIAL')
-    if url and user and cred:
-        urls = [u.strip() for u in str(url).split(',') if u.strip()]
+    config = {'iceServers': servers}
+    urls = parse_turn_urls(_secret('TURN_URL'))
+    user, cred = _secret('TURN_USERNAME'), _secret('TURN_CREDENTIAL')
+    if urls and user and cred:
         servers.append({'urls': urls, 'username': str(user), 'credential': str(cred)})
-    return {'iceServers': servers}
+        if str(_secret('TURN_FORCE_RELAY')).lower() in ('1', 'true', 'yes'):
+            config['iceTransportPolicy'] = 'relay'
+    return config
+
+
+def turn_status():
+    urls = parse_turn_urls(_secret('TURN_URL'))
+    if urls and _secret('TURN_USERNAME') and _secret('TURN_CREDENTIAL'):
+        return f'TURN relay: configured ({len(urls)} URLs)'
+    return 'TURN relay: not configured (STUN only)'
 
 
 @st.cache_resource
@@ -130,6 +153,7 @@ class EmotionVideoProcessor(VideoProcessorBase):
 st.title('Facial Emotion Recognition System')
 st.caption('CK+ facial-expression classifier • Handcrafted features • Multinomial Logistic Regression • No deep learning')
 page = st.sidebar.radio('Navigation', ['Live Recognition', 'Analytics Dashboard', 'Stored Data'])
+st.sidebar.caption(turn_status())
 st.sidebar.caption('Storage: ' + ('cloud SQL database' if is_cloud() else 'local SQLite (set DATABASE_URL for cloud)'))
 
 if page == 'Live Recognition':
@@ -140,7 +164,7 @@ if page == 'Live Recognition':
             key='emotion-live-camera',
             mode=WebRtcMode.SENDRECV,
             video_processor_factory=EmotionVideoProcessor,
-            media_stream_constraints={'video': True, 'audio': False},
+            media_stream_constraints={'video': {'width': {'ideal': 640}, 'height': {'ideal': 480}, 'frameRate': {'ideal': 15}}, 'audio': False},
             async_processing=True,
             rtc_configuration=get_rtc_configuration(),
         )
