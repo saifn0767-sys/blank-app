@@ -1,4 +1,5 @@
 import os
+import hashlib
 import re
 from pathlib import Path
 import time
@@ -102,6 +103,25 @@ except Exception as exc:
     st.stop()
 
 
+def predict_from_bytes(data):
+    """Decode an uploaded/captured photo and classify it. Returns (annotated_rgb, label, probs) or None."""
+    image = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+    if image is None:
+        return None
+    features, face, points = extract_all_features(image, predictor)
+    if features is None:
+        return image[:, :, ::-1], None, {}
+    raw_prob = model.predict_proba(features)[0]
+    classes = [str(c) for c in model.classes_]
+    probs = {c: float(p) for c, p in zip(classes, raw_prob)}
+    label = max(probs, key=probs.get)
+    display = image.copy()
+    for x, y in points.astype(int):
+        cv2.circle(display, (int(x), int(y)), max(1, image.shape[1] // 300), (50, 220, 80), -1)
+    return display[:, :, ::-1], label, probs
+
+
+
 class EmotionVideoProcessor(VideoProcessorBase):
     def __init__(self):
         self.last_log_time = 0.0
@@ -152,11 +172,37 @@ class EmotionVideoProcessor(VideoProcessorBase):
 
 st.title('Facial Emotion Recognition System')
 st.caption('CK+ facial-expression classifier • Handcrafted features • Multinomial Logistic Regression • No deep learning')
-page = st.sidebar.radio('Navigation', ['Live Recognition', 'Analytics Dashboard', 'Stored Data'])
+page = st.sidebar.radio('Navigation', ['Photo Capture', 'Live Recognition', 'Analytics Dashboard', 'Stored Data'])
 st.sidebar.caption(turn_status())
 st.sidebar.caption('Storage: ' + ('cloud SQL database' if is_cloud() else 'local SQLite (set DATABASE_URL for cloud)'))
 
-if page == 'Live Recognition':
+if page == 'Photo Capture':
+    st.markdown('### Photo capture')
+    st.caption('Take a photo or choose one from your gallery. The image is analysed in memory and is not saved; only the predicted result is stored in the database.')
+    source = st.radio('Source', ['Camera', 'Upload from gallery'], horizontal=True)
+    shot = st.camera_input('Take a photo') if source == 'Camera' else st.file_uploader('Choose a photo', type=['jpg', 'jpeg', 'png'])
+    if shot is not None:
+        data = shot.getvalue()
+        result = predict_from_bytes(data)
+        if result is None:
+            st.error('Could not read this image.')
+        else:
+            annotated, label, probs = result
+            st.image(annotated, use_container_width=True)
+            if label is None:
+                st.warning('No face detected. Face the camera, use good lighting and try again.')
+            else:
+                st.metric('Predicted expression', label.upper())
+                st.metric('Predicted class probability', f'{probs[label]:.1%}')
+                st.bar_chart({k: v for k, v in sorted(probs.items(), key=lambda x: x[1], reverse=True)})
+                digest = hashlib.md5(data).hexdigest()
+                if st.session_state.get('last_photo') != digest:
+                    log_prediction(f'photo-{state.session_id}', label, probs)
+                    st.session_state['last_photo'] = digest
+                st.caption('Result saved to the SQL database (image not stored).')
+    st.caption('Predicted facial-expression labels are not direct measurements of a person’s internal emotional state.')
+
+elif page == 'Live Recognition':
     st.markdown('### Live camera')
     col_video, col_result = st.columns([1.65, 1])
     with col_video:
